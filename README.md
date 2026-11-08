@@ -21,6 +21,12 @@ A virtualized cybersecurity laboratory combining perimeter monitoring, endpoint 
 
 The documented **observations**, **implemented configurations** and **reproducible exercise procedures** serve different purposes. Each is presented in its relevant section so that detector behavior is not confused with a confirmed incident or an assumed test result.
 
+### Documentation layout
+
+This README is a **self-contained technical case study**. The network architecture, collection configurations, five custom Wazuh rules, detection exercises and investigation methodology are included directly below; no additional `.xml`, `.conf` or test fixture files are required to read the project. The snippets document the laboratory configuration and associated procedures; they are not represented as untouched exports from a running machine.
+
+All nine screenshots referenced in this document are expected in the repository's root `assets/` directory, with the exact filenames shown in the image links. The screenshots illustrate the original deployment and network detections; the tested SSH containment is reported as a functional observation, without claiming a preserved screenshot or a complete log export.
+
 > **Scope:** All IP addresses belong to a private virtual laboratory. Attack examples target only owned or explicitly authorized lab resources.
 
 ## 1. Context and business objectives
@@ -34,7 +40,7 @@ The engineering scope covers:
 - deploying a network intrusion detection sensor where inbound traffic becomes visible;
 - using a central SIEM to organize endpoint and network security events;
 - making endpoint telemetry actionable with Sysmon, Windows Security events, Linux logs and file integrity monitoring;
-- defining version-controlled detection logic and benign/malicious test cases;
+- defining custom detection logic and controlled positive/negative test cases;
 - formalizing analyst investigations and safe response mechanisms.
 
 The project emphasizes **detection evidence, data-source quality, false-positive analysis and reproducibility**, rather than equating a vulnerability probe with successful exploitation.
@@ -275,7 +281,7 @@ tail -n 2 /var/log/suricata/<LAN_INSTANCE>/eve.json
 
 ### 5.3. Transfer and parsing configuration
 
-The forwarding configuration uses **syslog-ng** on pfSense. Its file source reads the EVE file without interpreting each line as traditional Syslog; the TCP destination is configured to transmit the JSON message to the Wazuh host. The receiver is configured to write the extracted message into a dedicated JSONL file for Wazuh's JSON decoder. Correct preservation of one complete JSON object per line is checked using the steps in Section 5.4.
+The forwarding design uses **syslog-ng** on pfSense. Its file source reads EVE lines without interpreting them as traditional Syslog; the TCP destination sends the message body to the Wazuh host. The receiver is configured to write extracted messages into a dedicated JSONL file for Wazuh's JSON decoder. **This is an embedded configuration example, not a claim of a preserved end-to-end log export.** Depending on the transport's framing and receiver parser, the raw message may require adjustment so that one complete JSON object is preserved per line. Section 5.4 explains how to check this.
 
 **pfSense — syslog-ng source and destination:**
 
@@ -296,7 +302,7 @@ log {
 };
 ```
 
-The corresponding repository artifact is [`pfsense-suricata-syslog-ng.conf`](soc-lab/configurations/pfsense-suricata-syslog-ng.conf). On the receiving side, the configured source-IP check permits messages from the pfSense LAN IP and the file output uses newline-delimited JSON. Since TCP sender/receiver behavior and Syslog header handling can vary with configuration, the JSONL file must be inspected to ensure the resulting messages remain valid JSON.
+The example is shown in full here; there is no separate configuration file in this repository. Replace `<LAN_INSTANCE>` with the actual directory created by the Suricata package on pfSense. On the receiving side, the source-IP check permits messages from pfSense's LAN address and the file output targets newline-delimited JSON. **The final JSONL contents must be inspected**: the custom `network()` template changes the on-wire format, and the rsyslog TCP input is a Syslog receiver. Successful TCP delivery alone does not prove that the receiver preserved each JSON object without a Syslog prefix or altered framing. These snippets are an integration design to validate against the installed versions, not proof of a completed end-to-end ingestion test. Restrict TCP/5514 to the lab's trusted internal source and adapt the transport for authenticated, encrypted production use.
 
 **Wazuh host — `/etc/rsyslog.d/30-suricata-eve.conf`:**
 
@@ -313,7 +319,7 @@ ruleset(name="soc_eve_ingress") {
 input(type="imtcp" address="10.0.0.10" port="5514" ruleset="soc_eve_ingress")
 ```
 
-The receiver definition is also stored as [`30-suricata-eve.conf`](soc-lab/configurations/30-suricata-eve.conf). The Wazuh Manager reads the preserved JSON file via the following element in its **existing** `/var/ossec/etc/ossec.conf`:
+The receiver configuration is shown above as a **standalone rsyslog example for a dedicated listener**; on an existing server it must be merged with any loaded `imtcp` module and existing input settings. On the Wazuh Manager, the following `<localfile>` entry belongs inside the **existing** `/var/ossec/etc/ossec.conf`; it is an excerpt, not a standalone file:
 
 ```xml
 <localfile>
@@ -343,11 +349,12 @@ sudo rsyslogd -N1
 sudo ss -lntp | grep ':5514'
 sudo tail -n 3 /var/log/soc/suricata-eve.json | jq -c .
 sudo /var/ossec/bin/wazuh-analysisd -t
-sudo jq -c 'select(.rule.id == "86601") | {time:.timestamp, rule:.rule.id, data:.data}' \
+sudo jq -c 'select((.rule.id | tostring) as $id | ["86601","100110","100111"] | index($id)) |
+  {time:.timestamp, rule:.rule.id, data:.data}' \
   /var/ossec/logs/alerts/alerts.json | tail -n 5
 ```
 
-The receiving configuration must be merged with any existing `imtcp` module declaration rather than loading the module twice. File ownership and JSON line formatting are material to successful ingestion. **Visibility in Wazuh confirms a decoded security event; it does not independently establish successful exploitation of the target.**
+The receiver configuration must be merged with any existing `imtcp` module declaration instead of loading the module twice. Access permissions must allow the Wazuh Manager to read the JSONL file; verify this alongside the payload format. A custom child rule may replace parent rule `86601` as the final alert ID, so inspection should include both the native and custom IDs. **Visibility in Wazuh confirms a decoded security event; it does not independently establish successful exploitation of the target.**
 
 ---
 
@@ -355,9 +362,9 @@ The receiving configuration must be merged with any existing `imtcp` module decl
 
 ### 6.1. Design principles
 
-The detection layer distinguishes between **raw events** and **security decisions**. A Suricata signature, Sysmon process creation, Windows failed logon or Linux integrity alert is first collected by its source. Wazuh rules then classify the event according to explicit criteria. The custom rules are maintained in a version-controlled XML file: [`local_rules.xml`](soc-lab/regles/local_rules.xml).
+The detection layer distinguishes between **raw events** and **security decisions**. A Suricata signature, Sysmon process creation, Windows failed logon or Linux integrity alert is first collected by its source. Wazuh rules then classify the event according to explicit criteria. **All five custom rule definitions are embedded directly in Sections 6.2–6.4.**
 
-The Wazuh Manager's installed path is `/var/ossec/etc/rules/local_rules.xml`. The custom IDs `100110`, `100111`, `100120`, `100121` and `100130` identify distinct conditions. They are not interchangeable with the original vendor rule IDs.
+For a Wazuh 4.x deployment, the XML `<group>` blocks belong in the manager's existing custom ruleset (typically `/var/ossec/etc/rules/local_rules.xml`), not in the README itself. The custom IDs `100110`, `100111`, `100120`, `100121` and `100130` identify distinct conditions; they are not interchangeable with the original vendor rule IDs. They are designed for the Wazuh 4.x-style rule format used in this laboratory: compatibility with a different manager/ruleset version must be checked before reuse.
 
 | Detection | Source | Condition | Custom rule | Priority |
 |---|---|---|---|---|
@@ -393,57 +400,65 @@ NET-02 deliberately says **possible XXE pattern**. A request signature alone can
 
 ### 6.3. Windows detection: encoded PowerShell execution
 
-**WIN-01** correlates four fields from Sysmon process creation: the originating Windows event channel, event ID, executable image, and launch arguments. Its objective is to identify the *encoded-command execution pattern*, not the specific contents of a test script.
+**WIN-01** refines Wazuh’s native Sysmon process-creation rule `61603` and correlates four fields: the originating Windows event channel, event ID, executable image, and launch arguments. Its objective is to identify the *encoded-command execution pattern*, not the specific contents of a test script.
 
 ```xml
-<rule id="100120" level="10">
-  <field name="win.system.channel" type="pcre2">^Microsoft-Windows-Sysmon/Operational$</field>
-  <field name="win.system.eventID" type="pcre2">^1$</field>
-  <field name="win.eventdata.image" type="pcre2">(?i)\\(powershell|pwsh)\.exe$</field>
-  <field name="win.eventdata.commandLine" type="pcre2">(?i)\s-(?:enc|encodedcommand)\b</field>
-  <description>SOC-LAB: PowerShell launched with encoded-command switch (Sysmon ID 1)</description>
-  <group>soc_lab,windows,powershell,</group>
-</rule>
+<group name="soc_lab,">
+  <rule id="100120" level="10">
+    <if_sid>61603</if_sid>
+    <field name="win.system.channel" type="pcre2">^Microsoft-Windows-Sysmon/Operational$</field>
+    <field name="win.system.eventID" type="pcre2">^1$</field>
+    <field name="win.eventdata.image" type="pcre2">(?i)\\(powershell|pwsh)\.exe$</field>
+    <field name="win.eventdata.commandLine" type="pcre2">(?i)\s-(?:enc|encodedcommand)\b</field>
+    <description>SOC-LAB: PowerShell launched with encoded-command switch (Sysmon ID 1)</description>
+    <group>soc_lab,windows,powershell,</group>
+  </rule>
+</group>
 ```
 
 The expression covers `powershell.exe` and `pwsh.exe`, case-insensitively, when invoked with `-enc` or `-EncodedCommand`. Administrators and deployment tools can also use this switch, so detection means **review required**, not automatic compromise attribution.
 
 ### 6.4. Windows authentication and Linux integrity changes
 
-**WIN-02** highlights a Windows Security `4625` failure. It is intentionally a **single-event** classifier, not a brute-force threshold detector.
+**WIN-02** refines native Windows logon-failure rule `60105` and highlights a Windows Security `4625` failure. It is intentionally a **single-event** classifier, not a brute-force threshold detector.
 
 ```xml
-<rule id="100121" level="5">
-  <field name="win.system.channel" type="pcre2">^Security$</field>
-  <field name="win.system.eventID" type="pcre2">^4625$</field>
-  <description>SOC-LAB: Failed Windows authentication (Security 4625)</description>
-  <group>soc_lab,windows,authentication_failed,</group>
-</rule>
+<group name="soc_lab,">
+  <rule id="100121" level="5">
+    <if_sid>60105</if_sid>
+    <field name="win.system.channel" type="pcre2">^Security$</field>
+    <field name="win.system.eventID" type="pcre2">^4625$</field>
+    <description>SOC-LAB: Failed Windows authentication (Security 4625)</description>
+    <group>soc_lab,windows,authentication_failed,</group>
+  </rule>
+</group>
 ```
 
 **LNX-01** increases the specificity of Wazuh's native file modification alert `550` for the monitored lab directory. Native events `554` (file added) and `553` (file deleted) remain distinct and are not mislabeled as modifications.
 
 ```xml
-<rule id="100130" level="7">
-  <if_sid>550</if_sid>
-  <field name="file" type="pcre2">^/opt/soc-canary/</field>
-  <description>SOC-LAB: Integrity change in the monitored Ubuntu canary directory</description>
-  <group>soc_lab,linux,fim,</group>
-</rule>
+<group name="soc_lab,">
+  <rule id="100130" level="7">
+    <if_sid>550</if_sid>
+    <field name="file" type="pcre2">^/opt/soc-canary/</field>
+    <description>SOC-LAB: Integrity change in the monitored Ubuntu canary directory</description>
+    <group>soc_lab,linux,fim,</group>
+  </rule>
+</group>
 ```
 
 In dashboard documents the FIM path is commonly represented by `syscheck.path`; the native FIM rule matcher exposes the `file` field to XML conditions. This difference between **rule-engine fields** and **indexed fields** matters when diagnosing a rule.
 
 ### 6.5. Ruleset validation method
 
-The five custom rules are maintained in the Wazuh ruleset alongside the built-in vendor definitions, without editing the vendor files. Structural validation and rule-behavior evaluation are distinct checks:
+The five rules above are displayed as independent, complete XML `<group>` fragments. To use them, combine the groups in the existing Wazuh custom rules file and leave the built-in vendor files untouched. In the Wazuh 4.x ruleset, `61603` identifies Sysmon Event ID 1, `60105` identifies Windows logon failure, `550` identifies a file modification, and `86601` identifies a Suricata alert. Their applicability depends on the installed ruleset version and decoded field names. Structural validation and rule-behavior evaluation are distinct checks:
 
 ```bash
 sudo /var/ossec/bin/wazuh-analysisd -t
 sudo /var/ossec/bin/wazuh-logtest
 ```
 
-The first command checks whether the manager can load its rules and configuration. The second evaluates supplied input records through pre-decoding, decoding and rule matching. The repository includes [controlled test inputs](soc-lab/tests/README.md) describing positive and negative patterns. These are **synthetic test fixtures**, not captured production alerts; the table specifies expected matching criteria rather than reporting execution statistics.
+The first command checks whether the manager can load its rules and configuration. The second evaluates input records through pre-decoding, decoding and rule matching. The following table describes positive and negative controls **inline** rather than requiring an external test file. It specifies expected matching behavior and does not assert that every listed validation was executed or captured.
 
 | Rule | Positive input pattern | Negative control pattern |
 |---|---|---|
@@ -496,7 +511,7 @@ The audit subcategory may have a localized name. Event field availability depend
 
 ### 7.2. Ubuntu: integrity and authentication
 
-The Ubuntu web target (`10.0.0.30`) supplies two independent forms of evidence: Wazuh **File Integrity Monitoring** and OpenSSH authentication records. A dedicated `/opt/soc-canary` directory confines integrity experiments to a nonproduction path.
+The Ubuntu web target (`10.0.0.30`) supplies two independent forms of evidence: Wazuh **File Integrity Monitoring** and OpenSSH authentication records. A dedicated `/opt/soc-canary` directory confines integrity experiments to a nonproduction path. Create the directory before enabling or restarting the Wazuh agent with the FIM configuration so that the monitored path exists when the agent starts.
 
 ```xml
 <!-- Add within the agent's existing syscheck block. -->
@@ -528,7 +543,7 @@ The use cases cover both network traffic and host telemetry. Each one specifies 
 
 ```bash
 # Executed only from the Kali VM against the private laboratory firewall.
-sudo nmap -sV -p 80 --script http-enum,http-vuln* 192.168.50.254
+sudo nmap -sV -p 80 --script "http-enum,http-vuln*" 192.168.50.254
 ```
 
 **Network finding.** Figure 9 documents actual local Suricata signature matches for Nmap NSE (`2009358`) and possible XXE-pattern (`2018056`) traffic. Their EVE representation and the corresponding Wazuh classification logic use built-in Suricata rule `86601` and custom rules `100110` and `100111`. The screenshot demonstrates **Suricata-side detection**; it should not be read as an independent screenshot of the same event arriving in Wazuh.
@@ -704,7 +719,7 @@ In a fresh validation run, a rule insertion without demonstrable connection deni
 sudo iptables -D INPUT -s 192.168.50.100 -j DROP
 ```
 
-The control must be limited to the attack-source subnet. Shared NAT addresses, legitimate authentication mistakes and absent source-IP fields are relevant false-positive and safety concerns. The management console remains accessible independently of SSH while source-IP blocking is exercised.
+The **SSH port-forwarding test rule** is restricted to the authorized Kali host (`192.168.50.100/32`). The Wazuh `firewall-drop` action, by contrast, blocks the **individual source IP extracted from the SSH alert**, not an entire network subnet. Shared NAT addresses, legitimate authentication mistakes and missing or incorrect source-IP fields are relevant false-positive and safety concerns. The VM management console remains accessible independently of SSH while source-IP blocking is exercised.
 
 ---
 
